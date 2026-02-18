@@ -312,90 +312,53 @@ def run_masked_normalize(
     return (tensor * mask / normalize_constant).sum(dim=dim)
 
 
-@torch.no_grad()
 def log_generations(
-    model: torch.nn.Module,
-    tokenizer: PreTrainedTokenizerBase,
     prompt_strs: list[str],
-    *,
+    generated_responses: list[str],
     ground_truths: list[str] | None = None,
-    reward_fn: Callable[[str, str], dict[str, float]] | None = None,
-    include_entropy: bool = False,
-    max_new_tokens: int = 128,
-    temperature: float = 0.0,
-    top_p: float = 1.0,
+    reward_infos: list[dict[str, float]] | None = None,
+    avg_token_entropies: list[float] | None = None,
+    response_lengths: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Log generations; reward/entropy metrics are optional."""
-    if ground_truths is not None and len(ground_truths) != len(prompt_strs):
+    """Format generation logs from precomputed data."""
+    n = len(prompt_strs)
+    if len(generated_responses) != n:
+        raise ValueError("generated_responses must have the same length as prompt_strs")
+    if ground_truths is not None and len(ground_truths) != n:
         raise ValueError("ground_truths must have the same length as prompt_strs")
-    if reward_fn is not None and ground_truths is None:
-        raise ValueError("ground_truths must be provided when reward_fn is provided")
-    if len(prompt_strs) == 0:
+    if reward_infos is not None and len(reward_infos) != n:
+        raise ValueError("reward_infos must have the same length as prompt_strs")
+    if avg_token_entropies is not None and len(avg_token_entropies) != n:
+        raise ValueError("avg_token_entropies must have the same length as prompt_strs")
+    if response_lengths is not None and len(response_lengths) != n:
+        raise ValueError("response_lengths must have the same length as prompt_strs")
+
+    if n == 0:
         return {"examples": [], "summary": {}}
 
-    was_training = model.training
-    model.eval()
-
-    batch = tokenizer(prompt_strs, padding=True, return_tensors="pt")
-    device = next(model.parameters()).device
-    input_ids = batch["input_ids"].to(device)
-    attention_mask = batch["attention_mask"].to(device)
-    prompt_lens = attention_mask.sum(dim=-1).tolist()
-
-    generated_ids = model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=max_new_tokens,
-        do_sample=temperature > 0.0,
-        temperature=temperature,
-        top_p=top_p,
-        pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
-    )
-
-    token_entropy = None
-    if include_entropy:
-        logits = model(input_ids=generated_ids, attention_mask=torch.ones_like(generated_ids)).logits
-        token_entropy = run_compute_entropy(logits)
-
-    pad_token_id = tokenizer.pad_token_id
-    if pad_token_id is None:
-        pad_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    if response_lengths is None:
+        response_lengths = [len(resp) for resp in generated_responses]
 
     examples: list[dict[str, Any]] = []
-    response_lengths: list[int] = []
-    entropy_values: list[float] = []
     reward_values: list[float] = []
     format_rewards: list[float] = []
     answer_rewards: list[float] = []
     lengths_correct: list[int] = []
     lengths_incorrect: list[int] = []
 
-    for i, prompt in enumerate(prompt_strs):
-        prompt_len = int(prompt_lens[i])
-        sample_ids = generated_ids[i]
-        response_ids = sample_ids[prompt_len:]
-        response_ids = response_ids[response_ids != pad_token_id]
-        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
-        response_len = int(response_ids.shape[0])
-        response_lengths.append(response_len)
-
+    for i, (prompt, response) in enumerate(zip(prompt_strs, generated_responses)):
         ex: dict[str, Any] = {
             "prompt": prompt,
-            "generated_response": response_text,
-            "response_length": response_len,
+            "generated_response": response,
+            "response_length": int(response_lengths[i]),
         }
+
         if ground_truths is not None:
             ex["ground_truth"] = ground_truths[i]
-
-        if include_entropy and token_entropy is not None:
-            start = max(prompt_len - 1, 0)
-            end = max(int(sample_ids.shape[0]) - 1, start)
-            avg_entropy = float(token_entropy[i, start:end].mean().item()) if end > start else 0.0
-            ex["avg_token_entropy"] = avg_entropy
-            entropy_values.append(avg_entropy)
-
-        if reward_fn is not None and ground_truths is not None:
-            reward_info = reward_fn(response_text, ground_truths[i])
+        if avg_token_entropies is not None:
+            ex["avg_token_entropy"] = float(avg_token_entropies[i])
+        if reward_infos is not None:
+            reward_info = reward_infos[i]
             ex["reward_info"] = reward_info
             reward = float(reward_info.get("reward", 0.0))
             format_reward = float(reward_info.get("format_reward", 0.0))
@@ -404,19 +367,21 @@ def log_generations(
             format_rewards.append(format_reward)
             answer_rewards.append(answer_reward)
             if answer_reward > 0.0:
-                lengths_correct.append(response_len)
+                lengths_correct.append(int(response_lengths[i]))
             else:
-                lengths_incorrect.append(response_len)
+                lengths_incorrect.append(int(response_lengths[i]))
 
         examples.append(ex)
 
     def _avg(values: list[float] | list[int]) -> float:
         return float(sum(values) / len(values)) if values else 0.0
 
-    summary: dict[str, float] = {"avg_response_length": _avg(response_lengths)}
-    if include_entropy:
-        summary["avg_token_entropy"] = _avg(entropy_values)
-    if reward_fn is not None:
+    summary: dict[str, float] = {
+        "avg_response_length": _avg(response_lengths),
+    }
+    if avg_token_entropies is not None:
+        summary["avg_token_entropy"] = _avg(avg_token_entropies)
+    if reward_infos is not None:
         summary.update(
             {
                 "avg_reward": _avg(reward_values),
@@ -427,8 +392,6 @@ def log_generations(
             }
         )
 
-    if was_training:
-        model.train()
     return {"examples": examples, "summary": summary}
 
 
