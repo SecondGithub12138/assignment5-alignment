@@ -31,7 +31,38 @@ def run_tokenize_prompt_and_output(
             "response_mask": torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1):
                 a mask on the response tokens in `labels`.
     """
-    raise NotImplementedError
+    outputs = {"input_ids": [], "labels": [], "response_mask": []}
+    max_concat_len = 0
+    concat_list: list[list[int]] = []
+    mark_true_idx_list: list[int] = []
+
+    for prompt_str, output_str in zip(prompt_strs, output_strs):
+        concat = tokenizer.encode(prompt_str) + tokenizer.encode(output_str)
+        mark_true_idx = len(tokenizer.encode(prompt_str))
+        concat_list.append(concat)
+        mark_true_idx_list.append(mark_true_idx)
+        max_concat_len = max(max_concat_len, len(concat))
+
+    for concat, mark_true_idx in zip(concat_list, mark_true_idx_list):
+        pad_len = max_concat_len - len(concat)
+        concat_padded = concat + [tokenizer.pad_token_id] * pad_len
+        input_ids = concat_padded[:-1]
+        labels = concat_padded[1:]
+        response_mask = (
+            [False] * (mark_true_idx - 1)
+            + [True] * (len(concat) - mark_true_idx)
+            + [False] * pad_len
+        )
+
+        outputs["input_ids"].append(input_ids)
+        outputs["labels"].append(labels)
+        outputs["response_mask"].append(response_mask)
+
+    return {
+        "input_ids": torch.tensor(outputs["input_ids"], dtype=torch.long),
+        "labels": torch.tensor(outputs["labels"], dtype=torch.long),
+        "response_mask": torch.tensor(outputs["response_mask"], dtype=torch.bool),
+    }
 
 
 def run_compute_group_normalized_rewards(
@@ -82,7 +113,9 @@ def run_compute_group_normalized_rewards(
 
 def run_compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     """Get the entropy of the logits (i.e., entropy of the final dimension)."""
-    raise NotImplementedError
+    probs = torch.softmax(logits, dim=-1)
+    log_probs = torch.log_softmax(logits, dim=-1)
+    return -(probs * log_probs).sum(dim=-1)
 
 
 def run_get_response_log_probs(
@@ -90,7 +123,7 @@ def run_get_response_log_probs(
     input_ids: torch.Tensor,
     labels: torch.Tensor,
     return_token_entropy: bool,
-) -> torch.Tensor:
+) -> dict[str, torch.Tensor]:
     """Get the conditional log-probs of the response given the prompt,
         and optionally the entropy of the next token predictions.
 
@@ -114,7 +147,13 @@ def run_get_response_log_probs(
                 we have not masked out the token indices corresponding to the prompt
                 or padding; that is done in the train loop.
     """
-    raise NotImplementedError
+    logits = model(input_ids=input_ids).logits
+    all_log_probs = torch.log_softmax(logits, dim=-1)
+    log_probs = all_log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+    output: dict[str, torch.Tensor] = {"log_probs": log_probs}
+    if return_token_entropy:
+        output["token_entropy"] = run_compute_entropy(logits)
+    return output
 
 
 def run_compute_naive_policy_gradient_loss(
@@ -203,7 +242,10 @@ def run_sft_microbatch_train_step(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the policy gradient loss and backprop its gradients for a microbatch.
     """
-    raise NotImplementedError
+    masked_normalize_nll = -run_masked_normalize(policy_log_probs, response_mask, -1, normalize_constant)
+    loss = masked_normalize_nll.mean() / gradient_accumulation_steps
+    loss.backward()
+    return loss, {}
 
     
 def run_grpo_microbatch_train_step(
@@ -267,7 +309,127 @@ def run_masked_normalize(
         torch.Tensor, the normalized sum, where masked elements
             (mask=0) don't contribute to the sum.
     """
-    raise NotImplementedError
+    return (tensor * mask / normalize_constant).sum(dim=dim)
+
+
+@torch.no_grad()
+def log_generations(
+    model: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    prompt_strs: list[str],
+    *,
+    ground_truths: list[str] | None = None,
+    reward_fn: Callable[[str, str], dict[str, float]] | None = None,
+    include_entropy: bool = False,
+    max_new_tokens: int = 128,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+) -> dict[str, Any]:
+    """Log generations; reward/entropy metrics are optional."""
+    if ground_truths is not None and len(ground_truths) != len(prompt_strs):
+        raise ValueError("ground_truths must have the same length as prompt_strs")
+    if reward_fn is not None and ground_truths is None:
+        raise ValueError("ground_truths must be provided when reward_fn is provided")
+    if len(prompt_strs) == 0:
+        return {"examples": [], "summary": {}}
+
+    was_training = model.training
+    model.eval()
+
+    batch = tokenizer(prompt_strs, padding=True, return_tensors="pt")
+    device = next(model.parameters()).device
+    input_ids = batch["input_ids"].to(device)
+    attention_mask = batch["attention_mask"].to(device)
+    prompt_lens = attention_mask.sum(dim=-1).tolist()
+
+    generated_ids = model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=max_new_tokens,
+        do_sample=temperature > 0.0,
+        temperature=temperature,
+        top_p=top_p,
+        pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
+    )
+
+    token_entropy = None
+    if include_entropy:
+        logits = model(input_ids=generated_ids, attention_mask=torch.ones_like(generated_ids)).logits
+        token_entropy = run_compute_entropy(logits)
+
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+
+    examples: list[dict[str, Any]] = []
+    response_lengths: list[int] = []
+    entropy_values: list[float] = []
+    reward_values: list[float] = []
+    format_rewards: list[float] = []
+    answer_rewards: list[float] = []
+    lengths_correct: list[int] = []
+    lengths_incorrect: list[int] = []
+
+    for i, prompt in enumerate(prompt_strs):
+        prompt_len = int(prompt_lens[i])
+        sample_ids = generated_ids[i]
+        response_ids = sample_ids[prompt_len:]
+        response_ids = response_ids[response_ids != pad_token_id]
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+        response_len = int(response_ids.shape[0])
+        response_lengths.append(response_len)
+
+        ex: dict[str, Any] = {
+            "prompt": prompt,
+            "generated_response": response_text,
+            "response_length": response_len,
+        }
+        if ground_truths is not None:
+            ex["ground_truth"] = ground_truths[i]
+
+        if include_entropy and token_entropy is not None:
+            start = max(prompt_len - 1, 0)
+            end = max(int(sample_ids.shape[0]) - 1, start)
+            avg_entropy = float(token_entropy[i, start:end].mean().item()) if end > start else 0.0
+            ex["avg_token_entropy"] = avg_entropy
+            entropy_values.append(avg_entropy)
+
+        if reward_fn is not None and ground_truths is not None:
+            reward_info = reward_fn(response_text, ground_truths[i])
+            ex["reward_info"] = reward_info
+            reward = float(reward_info.get("reward", 0.0))
+            format_reward = float(reward_info.get("format_reward", 0.0))
+            answer_reward = float(reward_info.get("answer_reward", 0.0))
+            reward_values.append(reward)
+            format_rewards.append(format_reward)
+            answer_rewards.append(answer_reward)
+            if answer_reward > 0.0:
+                lengths_correct.append(response_len)
+            else:
+                lengths_incorrect.append(response_len)
+
+        examples.append(ex)
+
+    def _avg(values: list[float] | list[int]) -> float:
+        return float(sum(values) / len(values)) if values else 0.0
+
+    summary: dict[str, float] = {"avg_response_length": _avg(response_lengths)}
+    if include_entropy:
+        summary["avg_token_entropy"] = _avg(entropy_values)
+    if reward_fn is not None:
+        summary.update(
+            {
+                "avg_reward": _avg(reward_values),
+                "avg_format_reward": _avg(format_rewards),
+                "avg_answer_reward": _avg(answer_rewards),
+                "avg_response_length_correct": _avg(lengths_correct),
+                "avg_response_length_incorrect": _avg(lengths_incorrect),
+            }
+        )
+
+    if was_training:
+        model.train()
+    return {"examples": examples, "summary": summary}
 
 
 """
