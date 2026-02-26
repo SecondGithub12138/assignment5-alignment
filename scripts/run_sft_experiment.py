@@ -69,7 +69,7 @@ def main():
     MICRO_BATCH = 8 
     GRAD_ACCUM = 4
     DATA_SET_SIZE = 128 # {128, 256, 512, 1024}
-    for i in range(0, len(train_data["input_ids"]), MICRO_BATCH):
+    for i in range(0, DATA_SET_SIZE, MICRO_BATCH):
         log_probs = run_get_response_log_probs(model, train_data["input_ids"][i: i + MICRO_BATCH], train_data["labels"][i: i + MICRO_BATCH], True)
         # dict[str, torch.Tensor]:
         #     "log_probs": torch.Tensor of shape (batch_size, sequence_length):
