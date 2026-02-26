@@ -513,7 +513,6 @@ def latex_eval(latex):
     val = sym.evalf()
     return sym, val
 
-
 def numeric_equal(prediction: float, reference: float):
     # Note that relative tolerance has significant impact
     # on the result of the synthesized GSM-Hard dataset

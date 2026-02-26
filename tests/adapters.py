@@ -57,12 +57,12 @@ def run_tokenize_prompt_and_output(
         outputs["input_ids"].append(input_ids)
         outputs["labels"].append(labels)
         outputs["response_mask"].append(response_mask)
-
+    
     return {
         "input_ids": torch.tensor(outputs["input_ids"], dtype=torch.long),
         "labels": torch.tensor(outputs["labels"], dtype=torch.long),
         "response_mask": torch.tensor(outputs["response_mask"], dtype=torch.bool),
-    }
+    } 
 
 
 def run_compute_group_normalized_rewards(
