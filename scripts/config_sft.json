@@ -1,0 +1,10 @@
+{
+    "model_path": "/home/seanlinux/assignment5-alignment/models/Qwen2.5-Math-1.5B", 
+    "micro_batch": 2, 
+    "grad_accum": 128, 
+    "lr": 1e-5, 
+    "weight_decay": 0.0,
+    "beta1": 0.9,
+    "beta2": 0.95
+}
+

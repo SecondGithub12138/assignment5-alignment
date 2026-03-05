@@ -6,6 +6,7 @@ from tests.flag_util import get_args
 
 if __name__== "__main__":
     DATA_SET_SIZE = get_args().data_size
-    model_save_path = f"/home/seanlinux/assignment5-alignment/checkpoints/sft_{DATA_SET_SIZE}"
+    TRAIN_TYPE = get_args().train_type
+    model_save_path = f"/home/seanlinux/assignment5-alignment/checkpoints/{TRAIN_TYPE}_{DATA_SET_SIZE}"
     test_data_path = "/home/seanlinux/assignment5-alignment/data/gsm8k/test.jsonl"
     eval(test_data_path, model_save_path)

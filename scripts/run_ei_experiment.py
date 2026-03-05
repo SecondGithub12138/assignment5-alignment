@@ -10,36 +10,39 @@ from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from tests.sft_util import preparing_model, sft
 from tests.data_util import sample_batch
 from transformers import AutoTokenizer
-from tests.flag_util import get_args
+from tests.flag_util import get_args, get_config
 
 def main():
     DATA_SET_SIZE = get_args().data_size
-    GEN_MICRO_BATCH = 5
-    
-    model_path = "/home/seanlinux/assignment5-alignment/models/Qwen2.5-Math-1.5B"
+    config = get_config("ei")
+    micro_batch_gen = config["micro_batch_gen"] #Gen means generate, happened during data generation stage
+    model_path = config["model_path"]
+    ei_steps = config["ei_steps"]
+    rollouts = config["rollouts"]
+    sampling_max_tokens = config["sampling_max_tokens"]
+    sampling_min_tokens = config["sampling_min_tokens"]
+    sampling_temperature = config["sampling_temperature"]
+
     model = preparing_model(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    
 
-    EI_STEPS = 5
-    ROLLOUTS = 10
-    for i in range(EI_STEPS):
+    for i in range(ei_steps):
         filtered_sample_prompts = []
         filtered_sample_outputs = []
         total_generated = 0
         model.gradient_checkpointing_disable()
         all_prompt_strs, all_output_strs = sample_batch(DATA_SET_SIZE)  # Sample D_b once per EI step
-        for batch_idx in range(DATA_SET_SIZE//GEN_MICRO_BATCH):
-            start = batch_idx * GEN_MICRO_BATCH
-            prompt_strs = all_prompt_strs[start : start + GEN_MICRO_BATCH]
-            output_strs = all_output_strs[start : start + GEN_MICRO_BATCH]
+        for batch_idx in range(DATA_SET_SIZE//micro_batch_gen):
+            start = batch_idx * micro_batch_gen
+            prompt_strs = all_prompt_strs[start : start + micro_batch_gen]
+            output_strs = all_output_strs[start : start + micro_batch_gen]
             tokenizer.padding_side = "left"
             inputs = tokenizer(prompt_strs, return_tensors="pt", padding=True).to(model.device)
             ground_truths = []
             for output_str in output_strs:
                 ground_truths.append(output_str.split("<answer>")[-1].replace("</answer>", "").strip())
-            for _ in range(ROLLOUTS):
-                generated_ids = model.generate(**inputs, max_new_tokens=512, do_sample=True, temperature=0.8)
+            for _ in range(rollouts):
+                generated_ids = model.generate(**inputs, max_new_tokens=sampling_max_tokens, min_new_tokens=sampling_min_tokens, do_sample=True, temperature=sampling_temperature)
                 generated_sample_outputs = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
                 total_generated += len(generated_sample_outputs)
                 del generated_ids
@@ -50,12 +53,12 @@ def main():
                         continue
                     filtered_sample_outputs.append(response)
                     filtered_sample_prompts.append(prompt)
-            # Data collection done, start sft
-        print(f"[EI step {i+1}/{EI_STEPS}] Collection done: generated={total_generated}, filtered={len(filtered_sample_prompts)}")
+        # Data collection done, start sft
+        print(f"[EI step {i+1}/{ei_steps}] Collection done: generated={total_generated}, filtered={len(filtered_sample_prompts)}")
         if filtered_sample_prompts:
             model.gradient_checkpointing_enable()
             tokenizer.padding_side = "right" 
-            sft(filtered_sample_prompts, filtered_sample_outputs, tokenizer, model)
+            sft(filtered_sample_prompts, filtered_sample_outputs, tokenizer, model, "ei")
     print("Saving model ...")
     model_save_path = f"/home/seanlinux/assignment5-alignment/checkpoints/ei_{DATA_SET_SIZE}"
     Path(model_save_path).mkdir(parents=True, exist_ok=True)

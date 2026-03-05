@@ -30,18 +30,20 @@ from transformers import AutoTokenizer
 from tests.adapters import run_tokenize_prompt_and_output, run_get_response_log_probs, run_sft_microbatch_train_step
 from tests.sft_util import preparing_model, sft
 from tests.data_util import sample_batch
-from tests.flag_util import get_args
+from tests.flag_util import get_args, get_config
 import torch
 import time
+import json
 
 def main():
-    model_path = "/home/seanlinux/assignment5-alignment/models/Qwen2.5-Math-1.5B"
-    model = preparing_model(model_path)
     DATA_SET_SIZE = get_args().data_size
+    model_path = get_config("sft")["model_path"]
+    model = preparing_model(model_path)
+    
     prompt_strs, output_strs = sample_batch(DATA_SET_SIZE)
     print("[3/6] Tokenizing data ...")
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    sft(prompt_strs, output_strs, tokenizer, model)
+    sft(prompt_strs, output_strs, tokenizer, model, "sft")
     print("[5/6] Saving model ...")
     model_save_path = f"/home/seanlinux/assignment5-alignment/checkpoints/sft_{DATA_SET_SIZE}"
     Path(model_save_path).mkdir(parents=True, exist_ok=True)
