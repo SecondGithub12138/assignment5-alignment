@@ -52,7 +52,7 @@ def eval(dataset_path: str, model_path: str):
     with open(output_path, "w") as f:
         for prompt, raw, ground_truth, answer in zip (prompts, raws, ground_truths, answers):
             response = raw.outputs[0].text 
-            metrics = r1_zero_reward_fn(response, ground_truth, True)
+            metrics = r1_zero_reward_fn(response, ground_truth, False)
             result = {
                 "prompt": prompt,
                 "ground_truth": ground_truth,

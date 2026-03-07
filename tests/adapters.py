@@ -72,7 +72,7 @@ def run_compute_group_normalized_rewards(
     group_size: int,
     advantage_eps: float,
     normalize_by_std: bool,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     # reward_fn: Callable[[str, str], dict[str, float]], 
     #     scores the rollout responses against the ground truths, 
     #     producing a dict with keys 
@@ -86,8 +86,6 @@ def run_compute_group_normalized_rewards(
             batch_group_rewards.append(group_rewards)
             group_rewards = []
     rewards_tensor = torch.tensor(batch_group_rewards, dtype=torch.float32)
-
-    
     mean = rewards_tensor.mean(dim=-1, keepdim=True) 
     std = rewards_tensor.std(dim=-1, keepdim=True) 
     group_normalized_rewards = (rewards_tensor - mean) / (std + advantage_eps)
@@ -275,6 +273,7 @@ def run_sft_microbatch_train_step(
     """Compute the policy gradient loss and backprop its gradients for a microbatch.
     """
     masked_normalize_nll = -run_masked_normalize(policy_log_probs, response_mask, -1, normalize_constant)
+    # (tensor * mask / normalize_constant).sum(dim=-1), shape [batch_size]
     loss = masked_normalize_nll.mean() / gradient_accumulation_steps
     loss.backward()
     return loss, {}
@@ -290,6 +289,18 @@ def run_grpo_microbatch_train_step(
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    per_token_loss, _ = run_compute_policy_gradient_loss(policy_log_probs, loss_type, raw_rewards, advantages, old_log_probs, cliprange)
+    # 77% validation accuracy
+    masked_loss = run_masked_mean(per_token_loss, response_mask)
+    loss = masked_loss/gradient_accumulation_steps
+
+    # 73.2% validation accuracy
+    # masked_normalize_nll = run_masked_normalize(per_token_loss, response_mask, -1, per_token_loss.shape[-1])
+    # loss = masked_normalize_nll.mean() / gradient_accumulation_steps
+
+    loss.backward()
+    return loss, {}
+
     """Compute the policy gradient loss and backprop its gradients for a microbatch.
 
     Args:
@@ -316,7 +327,6 @@ def run_grpo_microbatch_train_step(
         tuple[torch.Tensor, dict[str, torch.Tensor]]: 
             the policy gradient loss and its metadata.
     """
-    raise NotImplementedError
 
 
 def run_masked_normalize(

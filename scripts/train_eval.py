@@ -9,6 +9,8 @@ from tests.flag_util import get_args
 
 DATA_SET_SIZE = 16 # for sft and ei only
 TRAIN_TYPE = get_args().train_type
+if TRAIN_TYPE == "grpo":
+    DATA_SET_SIZE = 2
 
 SCRIPTS = Path(__file__).resolve().parent
 log_path = SCRIPTS.parent / "results" / f"run_{TRAIN_TYPE}_{DATA_SET_SIZE}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
