@@ -70,6 +70,8 @@ def eval(dataset_path: str, model_path: str):
     correct_format_wrong_answer = sum(1 for m in all_metrics if m["format_reward"] == 1.0 and m["answer_reward"] == 0.0)
     wrong_format_wrong_answer = sum(1 for m in all_metrics if m["format_reward"] == 0.0 and m["answer_reward"] == 0.0)
     accuracy = correct_format_correct_answer / total if total > 0 else 0.0
+    answer_reward_mean = sum(m["answer_reward"] for m in all_metrics) / total if total > 0 else 0.0
+    format_reward_mean = sum(m["format_reward"] for m in all_metrics) / total if total > 0 else 0.0
 
     logger.info(f"Format correct, answer correct : {correct_format_correct_answer} ({accuracy:.1%})")
     logger.info(f"Format correct, answer wrong   : {correct_format_wrong_answer} ({correct_format_wrong_answer/total:.1%})")
@@ -79,6 +81,18 @@ def eval(dataset_path: str, model_path: str):
     del model
     import gc
     gc.collect()
+    return {
+        "accuracy": accuracy,
+        "answer_reward_mean": answer_reward_mean,
+        "format_reward_mean": format_reward_mean,
+        "correct_format_correct_answer": correct_format_correct_answer,
+        "correct_format_wrong_answer": correct_format_wrong_answer,
+        "wrong_format_wrong_answer": wrong_format_wrong_answer,
+        "total": total,
+        "vllm_load_s": vllm_load_elapsed,
+        "eval_infer_s": infer_elapsed,
+        "results_path": output_path,
+    }
 
 def load_dataset(dataset_path) -> list[dict]:
     examples = []

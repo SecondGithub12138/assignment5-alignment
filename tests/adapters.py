@@ -176,6 +176,41 @@ def run_get_response_log_probs(
     return output
 
 
+def run_get_response_log_probs_chunked(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    return_token_entropy: bool,
+    chunk_size: int,
+    device: torch.device | None = None,
+) -> dict[str, torch.Tensor]:
+    """Same as run_get_response_log_probs but processes in microbatches to avoid OOM.
+
+    Use for large batches (e.g. rollout generation); use run_get_response_log_probs
+    directly when batch is already small (e.g. training micro_batch).
+    """
+    n = input_ids.shape[0]
+    if n <= chunk_size:
+        inp = input_ids.to(device or next(model.parameters()).device)
+        lab = labels.to(device or inp.device)
+        return run_get_response_log_probs(model, inp, lab, return_token_entropy)
+
+    device = device or next(model.parameters()).device
+    chunks: list[dict[str, torch.Tensor]] = []
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        chunk_inp = input_ids[start:end].to(device)
+        chunk_lab = labels[start:end].to(device)
+        out = run_get_response_log_probs(model, chunk_inp, chunk_lab, return_token_entropy)
+        chunks.append(out)
+
+    log_probs = torch.cat([c["log_probs"] for c in chunks], dim=0)
+    result: dict[str, torch.Tensor] = {"log_probs": log_probs}
+    if return_token_entropy:
+        result["token_entropy"] = torch.cat([c["token_entropy"] for c in chunks], dim=0)
+    return result
+
+
 def run_compute_naive_policy_gradient_loss(
     raw_rewards_or_advantages: torch.Tensor,
     policy_log_probs: torch.Tensor,
@@ -288,16 +323,15 @@ def run_grpo_microbatch_train_step(
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
+    loss_aggregation: Literal["masked_mean", "masked_normalize"] = "masked_mean",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     per_token_loss, _ = run_compute_policy_gradient_loss(policy_log_probs, loss_type, raw_rewards, advantages, old_log_probs, cliprange)
-    # 77% validation accuracy
-    masked_loss = run_masked_mean(per_token_loss, response_mask)
-    loss = masked_loss/gradient_accumulation_steps
-
-    # 73.2% validation accuracy
-    # masked_normalize_nll = run_masked_normalize(per_token_loss, response_mask, -1, per_token_loss.shape[-1])
-    # loss = masked_normalize_nll.mean() / gradient_accumulation_steps
-
+    if loss_aggregation == "masked_mean":
+        masked_loss = run_masked_mean(per_token_loss, response_mask)
+        loss = masked_loss / gradient_accumulation_steps
+    else:  # masked_normalize
+        masked_normalize_nll = run_masked_normalize(per_token_loss, response_mask, -1, policy_log_probs.shape[-1])
+        loss = masked_normalize_nll.mean() / gradient_accumulation_steps
     loss.backward()
     return loss, {}
 

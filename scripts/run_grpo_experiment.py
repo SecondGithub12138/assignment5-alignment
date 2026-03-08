@@ -13,11 +13,11 @@ from tests.sft_util import preparing_model, sft
 from tests.data_util import sample_batch
 from transformers import AutoTokenizer
 from tests.flag_util import get_args, get_config
-from tests.adapters import run_compute_group_normalized_rewards, run_grpo_microbatch_train_step, run_tokenize_prompt_and_output, run_get_response_log_probs, run_masked_mean
+from tests.adapters import run_compute_group_normalized_rewards, run_grpo_microbatch_train_step, run_tokenize_prompt_and_output, run_get_response_log_probs, run_get_response_log_probs_chunked, run_masked_mean
 
 def main():
-    # DATA_SET_SIZE = get_args().data_size
-    config = get_config("grpo")
+    args = get_args()
+    config = get_config("grpo", path_override=args.config_path)
     n_grpo_steps: int = config["n_grpo_steps"]
     lr: float = config["lr"]
     advantage_eps: float =  config["advantage_eps"]
@@ -33,6 +33,7 @@ def main():
         "grpo_clip",
     ] = config["loss_type"] # 'no_baseline', 'reinforce_with_baseline', 'grpo_clip'
     use_std_normalization: bool = config["use_std_normalization"]
+    loss_aggregation: Literal["masked_mean", "masked_normalize"] = config.get("loss_aggregation", "masked_mean")
     weight_decay = config["weight_decay"]
     beta1 = config["beta1"]
     beta2 = config["beta2"]
@@ -52,7 +53,7 @@ def main():
     # gpu_memory_utilization: float = 0.85
     
 
-    print(f"[Hyperparameters] n_grpo_steps={n_grpo_steps} | lr={lr} | grad_accum={grad_accum} | group_size={group_size} | rollout_batch_size={rollout_batch_size} | train_batch_size={train_batch_size} | DATA_SET_SIZE={DATA_SET_SIZE} | micro_batch_gen={micro_batch_gen} | loss_type={loss_type} | use_std_normalization={use_std_normalization} | sampling_temperature={sampling_temperature} | sampling_min_tokens={sampling_min_tokens} | sampling_max_tokens={sampling_max_tokens} | advantage_eps={advantage_eps} | weight_decay={weight_decay} | betas=({beta1},{beta2})")
+    print(f"[Hyperparameters] n_grpo_steps={n_grpo_steps} | lr={lr} | grad_accum={grad_accum} | group_size={group_size} | rollout_batch_size={rollout_batch_size} | train_batch_size={train_batch_size} | DATA_SET_SIZE={DATA_SET_SIZE} | micro_batch_gen={micro_batch_gen} | loss_type={loss_type} | loss_aggregation={loss_aggregation} | use_std_normalization={use_std_normalization} | epochs_per_rollout_batch={epochs_per_rollout_batch} | sampling_temperature={sampling_temperature} | sampling_min_tokens={sampling_min_tokens} | sampling_max_tokens={sampling_max_tokens} | advantage_eps={advantage_eps} | weight_decay={weight_decay} | betas=({beta1},{beta2})")
 
     model_path = "/home/seanlinux/assignment5-alignment/models/Qwen2.5-Math-1.5B"
     model = preparing_model(model_path)
@@ -92,13 +93,16 @@ def main():
                 generated_ids = model.generate(**inputs, max_new_tokens=sampling_max_tokens, min_new_tokens=sampling_min_tokens, do_sample=True, temperature=sampling_temperature) # generate id
                 prompt_len = inputs["input_ids"].shape[1]
                 generated_sample_outputs = tokenizer.batch_decode(generated_ids[:, prompt_len:], skip_special_tokens=True)
+                del generated_ids, inputs
+                torch.cuda.empty_cache()
                 old_train_data = run_tokenize_prompt_and_output(repeated_prompt_strs, generated_sample_outputs, tokenizer)
-                old_log_probs = run_get_response_log_probs(model, old_train_data["input_ids"], old_train_data["labels"], False)["log_probs"]
+                old_log_probs = run_get_response_log_probs_chunked(
+                    model, old_train_data["input_ids"], old_train_data["labels"],
+                    return_token_entropy=False, chunk_size=min(micro_batch_gen, 16), device=model.device,
+                )["log_probs"]
             print(f"      [sample output] {repr(generated_sample_outputs[0])}")
             all_generated_sample_outputs.extend(generated_sample_outputs) # transfer id to str
             all_old_log_probs_list.extend(old_log_probs)
-            
-            del generated_ids
             torch.cuda.empty_cache()
         print(f"Data generation done ... ({time.time() - gen_start:.1f}s)")
         # Data generated, start trining
@@ -129,9 +133,9 @@ def main():
                     token_entropy = output["token_entropy"]
                     micro_advantages = micro_advantages.unsqueeze(-1).to(device)
                     micro_raw_rewards = micro_raw_rewards.unsqueeze(-1).to(device)
-                    loss, _ = run_grpo_microbatch_train_step(log_probs, response_mask, grad_accum, loss_type, micro_raw_rewards, micro_advantages, micro_old_log_probs, 1)
+                    loss, _ = run_grpo_microbatch_train_step(log_probs, response_mask, grad_accum, loss_type, micro_raw_rewards, micro_advantages, micro_old_log_probs, 1, loss_aggregation)
                     mean_entropy = run_masked_mean(token_entropy, response_mask).item()
-                    mean_response_len = response_mask.sum(dim=-1).mean().item()
+                    mean_response_len = response_mask.sum(dim=-1).float().mean().item()
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
                     print(f"      [grad norm] {grad_norm:.4f}")
                     alloc = torch.cuda.memory_allocated() / 1024**3
@@ -144,7 +148,8 @@ def main():
         print(f"      [grpo_step {grpo_step}/{n_grpo_steps} finished] loss={loss:.6f} entropy={mean_entropy:.4f} response_len={mean_response_len:.1f} train_time={time.time()-train_start:.1f}s  [mem peak] allocated={grpo_alloc:.2f}GiB, reserved={grpo_reserved:.2f}GiB")
     # Data collection done, start sft
     print("Saving model ...")
-    model_save_path = f"/home/seanlinux/assignment5-alignment/checkpoints/grpo_{get_args().data_size}"
+    exp_id = args.exp_id or str(args.data_size)
+    model_save_path = f"/home/seanlinux/assignment5-alignment/checkpoints/grpo_{exp_id}"
     Path(model_save_path).mkdir(parents=True, exist_ok=True)
     model.save_pretrained(model_save_path)
     tokenizer.save_pretrained(model_save_path)
