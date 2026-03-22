@@ -327,11 +327,11 @@ def run_grpo_microbatch_train_step(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     per_token_loss, _ = run_compute_policy_gradient_loss(policy_log_probs, loss_type, raw_rewards, advantages, old_log_probs, cliprange)
     if loss_aggregation == "masked_mean":
-        masked_loss = run_masked_mean(per_token_loss, response_mask)
-        loss = masked_loss / gradient_accumulation_steps
+        masked_mean = run_masked_mean(per_token_loss, response_mask, -1) # masked_mean = masked and mean by mask (per row / this mean is within seq
+        loss = masked_mean.mean() / gradient_accumulation_steps # this mean is between seq
     else:  # masked_normalize
-        masked_normalize_nll = run_masked_normalize(per_token_loss, response_mask, -1, policy_log_probs.shape[-1])
-        loss = masked_normalize_nll.mean() / gradient_accumulation_steps
+        masked_normalize = run_masked_normalize(per_token_loss, response_mask, -1, policy_log_probs.shape[-1]) # masked_normalize = masked and mean by constant (per row / this mean is within seq
+        loss = masked_normalize.mean() / gradient_accumulation_steps # this mean is between seq
     loss.backward()
     return loss, {}
 

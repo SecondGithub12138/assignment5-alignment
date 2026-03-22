@@ -9,6 +9,7 @@ def get_args():
     parser.add_argument("--train_type", type=str, default="not_found")
     parser.add_argument("--exp_id", type=str, default=None, help="Experiment ID for checkpoint naming in sweep")
     parser.add_argument("--config_path", type=str, default=None, help="Override config file path for sweep")
+    parser.add_argument("--validation_step", type=int, default=None, help="Validation step to log for wandb eval metrics")
     return parser.parse_args()
     
 def get_config(train_type: str, path_override: str | Path | None = None):

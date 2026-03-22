@@ -8,7 +8,7 @@ import time
 
 logger = logging.getLogger(__name__)
 
-def eval(dataset_path: str, model_path: str):
+def eval(dataset_path: str, model_path: str) -> dict[str, float | int]:
     logging.basicConfig(level=logging.INFO)
     examples = load_dataset(dataset_path)
     # acquire template 
@@ -40,7 +40,8 @@ def eval(dataset_path: str, model_path: str):
     infer_start = time.time()
     raws = model.generate(prompts, eval_sampling_params)
     infer_elapsed = time.time() - infer_start
-    logger.info(f"[vLLM inference] {infer_elapsed:.1f}s for {len(prompts)} prompts ({len(prompts)/infer_elapsed:.1f} prompts/s)")
+    prompts_per_second = len(prompts) / infer_elapsed if infer_elapsed > 0 else 0.0
+    logger.info(f"[vLLM inference] {infer_elapsed:.1f}s for {len(prompts)} prompts ({prompts_per_second:.1f} prompts/s)")
     # following step is evaluation 
     # build response, ground truth
     # eval
@@ -70,8 +71,6 @@ def eval(dataset_path: str, model_path: str):
     correct_format_wrong_answer = sum(1 for m in all_metrics if m["format_reward"] == 1.0 and m["answer_reward"] == 0.0)
     wrong_format_wrong_answer = sum(1 for m in all_metrics if m["format_reward"] == 0.0 and m["answer_reward"] == 0.0)
     accuracy = correct_format_correct_answer / total if total > 0 else 0.0
-    answer_reward_mean = sum(m["answer_reward"] for m in all_metrics) / total if total > 0 else 0.0
-    format_reward_mean = sum(m["format_reward"] for m in all_metrics) / total if total > 0 else 0.0
 
     logger.info(f"Format correct, answer correct : {correct_format_correct_answer} ({accuracy:.1%})")
     logger.info(f"Format correct, answer wrong   : {correct_format_wrong_answer} ({correct_format_wrong_answer/total:.1%})")
@@ -83,15 +82,13 @@ def eval(dataset_path: str, model_path: str):
     gc.collect()
     return {
         "accuracy": accuracy,
-        "answer_reward_mean": answer_reward_mean,
-        "format_reward_mean": format_reward_mean,
+        "total": total,
         "correct_format_correct_answer": correct_format_correct_answer,
         "correct_format_wrong_answer": correct_format_wrong_answer,
         "wrong_format_wrong_answer": wrong_format_wrong_answer,
-        "total": total,
         "vllm_load_s": vllm_load_elapsed,
-        "eval_infer_s": infer_elapsed,
-        "results_path": output_path,
+        "inference_s": infer_elapsed,
+        "prompts_per_second": prompts_per_second,
     }
 
 def load_dataset(dataset_path) -> list[dict]:
