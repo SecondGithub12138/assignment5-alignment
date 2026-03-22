@@ -9,6 +9,12 @@ import time
 import torch
 from typing import Literal
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.wandb_util import (
+    init_wandb_run,
+    log_wandb_metrics,
+    make_rollout_summary_metrics,
+    make_train_step_metrics,
+)
 from tests.sft_util import preparing_model, sft
 from tests.data_util import sample_batch
 from transformers import AutoTokenizer
@@ -56,6 +62,18 @@ def main():
     print(f"[Hyperparameters] n_grpo_steps={n_grpo_steps} | lr={lr} | grad_accum={grad_accum} | group_size={group_size} | rollout_batch_size={rollout_batch_size} | train_batch_size={train_batch_size} | DATA_SET_SIZE={DATA_SET_SIZE} | micro_batch_gen={micro_batch_gen} | loss_type={loss_type} | loss_aggregation={loss_aggregation} | use_std_normalization={use_std_normalization} | epochs_per_rollout_batch={epochs_per_rollout_batch} | sampling_temperature={sampling_temperature} | sampling_min_tokens={sampling_min_tokens} | sampling_max_tokens={sampling_max_tokens} | advantage_eps={advantage_eps} | weight_decay={weight_decay} | betas=({beta1},{beta2})")
 
     model_path = "/home/seanlinux/assignment5-alignment/models/Qwen2.5-Math-1.5B"
+    run = init_wandb_run(
+        train_type="grpo",
+        exp_id=args.exp_id,
+        data_size=args.data_size,
+        job_type="train",
+        config={
+            "config_path": str(args.config_path) if args.config_path is not None else None,
+            **config,
+        },
+    )
+    print(f"[wandb] run={run.name} url={run.url}")
+
     model = preparing_model(model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     optimizer = torch.optim.AdamW(
@@ -65,20 +83,21 @@ def main():
         betas=(beta1, beta2),
     )
     optimizer.zero_grad()
+    run_start = time.time()
+    global_grad_step = 0
     for grpo_step in range(n_grpo_steps):
         model.gradient_checkpointing_disable()
         all_prompt_strs, all_output_strs = sample_batch(DATA_SET_SIZE)  # Sample D_b once per EI step
         all_repeated_prompt_strs = []
         all_repeated_ground_truths = []
         all_generated_sample_outputs = []
-        all_old_log_probs_list = []
         gen_start = time.time()
         for batch_gen_idx in range(DATA_SET_SIZE//micro_batch_gen):
             print(f"batch_gen_idx: {batch_gen_idx}")
             start = batch_gen_idx * micro_batch_gen
             prompt_strs = all_prompt_strs[start : start + micro_batch_gen]
             output_strs = all_output_strs[start : start + micro_batch_gen]
-            
+
             repeated_prompt_strs = [p for p in prompt_strs for _ in range(group_size)]
             ground_truths = []
             for output_str in output_strs:
@@ -88,46 +107,51 @@ def main():
             all_repeated_ground_truths.extend(repeated_ground_truths)
 
             tokenizer.padding_side = "left"
-            inputs = tokenizer(repeated_prompt_strs, return_tensors="pt", padding=True).to(model.device) # using hugging face, transfer str to id
+            inputs = tokenizer(repeated_prompt_strs, return_tensors="pt", padding=True).to(model.device)
             with torch.inference_mode():
-                generated_ids = model.generate(**inputs, max_new_tokens=sampling_max_tokens, min_new_tokens=sampling_min_tokens, do_sample=True, temperature=sampling_temperature) # generate id
+                generated_ids = model.generate(**inputs, max_new_tokens=sampling_max_tokens, min_new_tokens=sampling_min_tokens, do_sample=True, temperature=sampling_temperature, tokenizer=tokenizer, stop_strings=["</answer>"])
                 prompt_len = inputs["input_ids"].shape[1]
                 generated_sample_outputs = tokenizer.batch_decode(generated_ids[:, prompt_len:], skip_special_tokens=True)
                 del generated_ids, inputs
                 torch.cuda.empty_cache()
-                old_train_data = run_tokenize_prompt_and_output(repeated_prompt_strs, generated_sample_outputs, tokenizer)
-                old_log_probs = run_get_response_log_probs_chunked(
-                    model, old_train_data["input_ids"], old_train_data["labels"],
-                    return_token_entropy=False, chunk_size=min(micro_batch_gen, 16), device=model.device,
-                )["log_probs"]
             print(f"      [sample output] {repr(generated_sample_outputs[0])}")
-            all_generated_sample_outputs.extend(generated_sample_outputs) # transfer id to str
-            all_old_log_probs_list.extend(old_log_probs)
+            all_generated_sample_outputs.extend(generated_sample_outputs)
             torch.cuda.empty_cache()
         print(f"Data generation done ... ({time.time() - gen_start:.1f}s)")
-        # Data generated, start trining
+        # Data generated, tokenize once for entire rollout (same seq_len for old_log_probs and training)
         model.gradient_checkpointing_enable()
-        tokenizer.padding_side = "right" 
+        tokenizer.padding_side = "right"
         device = torch.device("cuda:0")
-        all_old_log_probs = torch.stack(all_old_log_probs_list, dim=0).to(device)
+        all_train_data = run_tokenize_prompt_and_output(all_repeated_prompt_strs, all_generated_sample_outputs, tokenizer)
+        torch.cuda.empty_cache()
+        with torch.inference_mode():
+            all_old_log_probs = run_get_response_log_probs_chunked(
+                model, all_train_data["input_ids"], all_train_data["labels"],
+                return_token_entropy=False, chunk_size=8, device=model.device,
+            )["log_probs"].to(device)
         all_advantages, all_raw_rewards, _ = run_compute_group_normalized_rewards(r1_zero_reward_fn, all_generated_sample_outputs, all_repeated_ground_truths, group_size, advantage_eps, use_std_normalization)
+        reward_mean = all_raw_rewards.float().mean().item()
+        reward_std = all_raw_rewards.float().std(unbiased=False).item()
+        advantage_mean = all_advantages.float().mean().item()
+        advantage_std = all_advantages.float().std(unbiased=False).item()
         train_start = time.time()
+        step_loss_sum = 0.0
+        step_entropy_sum = 0.0
+        step_response_len_sum = 0.0
+        step_metric_count = 0
         for _ in range(epochs_per_rollout_batch): # epochs
             # todo: could randomize the rollout_batch data 
             for train_batch_i in range(rollout_batch_size // train_batch_size): # how many train_batch per rollout batch
                 micro_batch = train_batch_size // grad_accum
                 for grad_accum_step in range(grad_accum): # how many round of gradient accumulation 
                     start = train_batch_i * train_batch_size + grad_accum_step * micro_batch
-                    micro_repeated_prompt_strs = all_repeated_prompt_strs[start: start + micro_batch]
-                    micro_generated_sample_outputs = all_generated_sample_outputs[start: start + micro_batch]
                     micro_old_log_probs = all_old_log_probs[start: start + micro_batch]
                     micro_advantages = all_advantages[start: start + micro_batch]
                     micro_raw_rewards = all_raw_rewards[start: start + micro_batch]
-                    
-                    train_data = run_tokenize_prompt_and_output(micro_repeated_prompt_strs, micro_generated_sample_outputs, tokenizer)
-                    input_ids = train_data["input_ids"].to(device)
-                    labels = train_data["labels"].to(device)
-                    response_mask = train_data["response_mask"].to(device)
+
+                    input_ids = all_train_data["input_ids"][start: start + micro_batch].to(device)
+                    labels = all_train_data["labels"][start: start + micro_batch].to(device)
+                    response_mask = all_train_data["response_mask"][start: start + micro_batch].to(device)
                     output = run_get_response_log_probs(model, input_ids, labels, return_token_entropy=True)
                     log_probs = output["log_probs"]
                     token_entropy = output["token_entropy"]
@@ -137,15 +161,58 @@ def main():
                     mean_entropy = run_masked_mean(token_entropy, response_mask).item()
                     mean_response_len = response_mask.sum(dim=-1).float().mean().item()
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+                    step_loss_sum += float(loss.item())
+                    step_entropy_sum += mean_entropy
+                    step_response_len_sum += mean_response_len
+                    step_metric_count += 1
                     print(f"      [grad norm] {grad_norm:.4f}")
                     alloc = torch.cuda.memory_allocated() / 1024**3
                     reserved = torch.cuda.memory_reserved() / 1024**3
                     print(f"      [grad step {grad_accum_step} / {grad_accum}] loss={loss:.6f} entropy={mean_entropy:.4f} response_len={mean_response_len:.1f}  [mem peak] allocated={alloc:.2f}GiB, reserved={reserved:.2f}GiB")
+                    log_wandb_metrics(
+                        make_train_step_metrics(
+                            loss=float(loss.item()),
+                            entropy=mean_entropy,
+                            response_len=mean_response_len,
+                            grad_norm=float(grad_norm.item()),
+                            mem_allocated_gib=alloc,
+                            mem_reserved_gib=reserved,
+                            grpo_step=grpo_step,
+                            grad_accum_step=grad_accum_step,
+                            global_grad_step=global_grad_step,
+                            reward_mean=reward_mean,
+                            reward_std=reward_std,
+                            advantage_mean=advantage_mean,
+                            advantage_std=advantage_std,
+                            wall_clock_s=time.time() - run_start,
+                        ),
+                        step=global_grad_step,
+                    )
+                    global_grad_step += 1
                 optimizer.step()
                 optimizer.zero_grad()
         grpo_alloc = torch.cuda.memory_allocated() / 1024**3
         grpo_reserved = torch.cuda.memory_reserved() / 1024**3
-        print(f"      [grpo_step {grpo_step}/{n_grpo_steps} finished] loss={loss:.6f} entropy={mean_entropy:.4f} response_len={mean_response_len:.1f} train_time={time.time()-train_start:.1f}s  [mem peak] allocated={grpo_alloc:.2f}GiB, reserved={grpo_reserved:.2f}GiB")
+        train_time = time.time() - train_start
+        mean_step_loss = step_loss_sum / step_metric_count
+        mean_step_entropy = step_entropy_sum / step_metric_count
+        mean_step_response_len = step_response_len_sum / step_metric_count
+        print(f"      [grpo_step {grpo_step}/{n_grpo_steps} finished] loss={mean_step_loss:.6f} entropy={mean_step_entropy:.4f} response_len={mean_step_response_len:.1f} train_time={train_time:.1f}s  [mem peak] allocated={grpo_alloc:.2f}GiB, reserved={grpo_reserved:.2f}GiB")
+        log_wandb_metrics(
+            make_rollout_summary_metrics(
+                grpo_step=grpo_step,
+                reward_mean=reward_mean,
+                reward_std=reward_std,
+                advantage_mean=advantage_mean,
+                advantage_std=advantage_std,
+                gen_s=time.time() - gen_start,
+                train_s=train_time,
+                wall_clock_s=time.time() - run_start,
+                mem_allocated_gib=grpo_alloc,
+                mem_reserved_gib=grpo_reserved,
+            ),
+            step=global_grad_step,
+        )
     # Data collection done, start sft
     print("Saving model ...")
     exp_id = args.exp_id or str(args.data_size)
@@ -155,6 +222,7 @@ def main():
     tokenizer.save_pretrained(model_save_path)
     print(f"      Saved to {model_save_path}")
     print("[6/6] Training done. Run eval separately:")
+    run.finish()
 
 if __name__ == "__main__":
     main()

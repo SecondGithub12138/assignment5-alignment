@@ -32,10 +32,10 @@ BASE_CONFIG = get_config("grpo")
 # E3: reinforce_with_baseline + masked_normalize + use_std_normalization=True
 # E4: reinforce_with_baseline + masked_mean + use_std_normalization=False
 EXPERIMENTS_PART1 = [
-    ("E1", {"loss_type": "no_baseline", "loss_aggregation": "masked_mean", "use_std_normalization": True}),
-    ("E2", {"loss_type": "reinforce_with_baseline", "loss_aggregation": "masked_mean", "use_std_normalization": True}),
-    ("E3", {"loss_type": "reinforce_with_baseline", "loss_aggregation": "masked_normalize", "use_std_normalization": True}),
-    ("E4", {"loss_type": "reinforce_with_baseline", "loss_aggregation": "masked_mean", "use_std_normalization": False}),
+    # ("E1", {"loss_type": "no_baseline", "loss_aggregation": "masked_mean", "use_std_normalization": True}),
+    # ("E2", {"loss_type": "reinforce_with_baseline", "loss_aggregation": "masked_mean", "use_std_normalization": True}),
+    # ("E3", {"loss_type": "reinforce_with_baseline", "loss_aggregation": "masked_normalize", "use_std_normalization": True}),
+    # ("E4", {"loss_type": "reinforce_with_baseline", "loss_aggregation": "masked_mean", "use_std_normalization": False}),
 ]
 
 # Part 2: C1-C4 - epochs_per_rollout_batch, train_batch_size
@@ -57,12 +57,15 @@ ALL_EXPERIMENTS = EXPERIMENTS_PART1 + EXPERIMENTS_PART2
 def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     sweep_log = RESULTS / f"run_grpo_sweep_{timestamp}.log"
+    run_configs_dir = CONFIGS / f"grpo_sweep_{timestamp}"
     RESULTS.mkdir(parents=True, exist_ok=True)
+    run_configs_dir.mkdir(parents=True, exist_ok=True)
     print(f"Sweep log: {sweep_log}")
+    print(f"Sweep configs: {run_configs_dir}")
 
     for exp_id, overrides in ALL_EXPERIMENTS:
         config = {**BASE_CONFIG, **overrides}
-        config_path = (CONFIGS / f"config_grpo_{exp_id}.json").resolve()
+        config_path = (run_configs_dir / f"config_grpo_{exp_id}.json").resolve()
         with open(config_path, "w") as f:
             json.dump(config, f, indent=4)
 
@@ -91,6 +94,7 @@ def main():
                 "--data_size", str(DATA_SET_SIZE),
                 "--train_type", "grpo",
                 "--exp_id", exp_id,
+                "--validation_step", str(config["n_grpo_steps"]),
             ]
             subprocess.run(eval_cmd, stdout=f, stderr=f, check=True)
 
