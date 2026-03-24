@@ -1,6 +1,7 @@
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
+from contextlib import nullcontext
 import sys
 import time
 from pathlib import Path
@@ -39,10 +40,11 @@ from tests.data_util import sample_batch
 MODEL_NAME = "/home/seanlinux/assignment5-alignment/models/Qwen2.5-Math-1.5B"
 WORKSPACE = "/home/seanlinux/assignment5-alignment"
 
-TRAIN_GPU_COUNT = 32
+TRAIN_GPU_COUNT = 16
 VLLM_TP_SIZE = 2
-VLLM_DP_SIZE = 8
+VLLM_DP_SIZE = 4
 VLLM_GPU_COUNT = VLLM_TP_SIZE * VLLM_DP_SIZE
+GPUS_PER_NODE = 8
 
 GROUP_SIZE = 8
 ROLLOUT_BATCH_SIZE = 256
@@ -103,69 +105,38 @@ def discover_gpu_nodes() -> list[dict[str, Any]]:
     return nodes
 
 
-def _allocate_gpus_on_disjoint_nodes(
-    nodes: list[dict[str, Any]], required_gpus: int
-) -> tuple[list[tuple[dict[str, Any], int]], list[dict[str, Any]]]:
-    """
-    Greedy allocator on sorted nodes.
-    Returns (allocation, remaining_nodes).
-    """
-    if required_gpus <= 0:
-        return [], nodes
-
-    remaining = required_gpus
-    allocation: list[tuple[dict[str, Any], int]] = []
-    used_keys = set()
-    for node in nodes:
-        if remaining == 0:
-            break
-        take = min(node["gpus"], remaining)
-        if take <= 0:
-            continue
-        allocation.append((node, take))
-        used_keys.add(node["resource_key"])
-        remaining -= take
-
-    if remaining > 0:
-        total = sum(n["gpus"] for n in nodes)
-        raise RuntimeError(
-            f"Not enough GPUs: need {required_gpus}, have {total} across nodes={nodes}"
-        )
-
-    remaining_nodes = [n for n in nodes if n["resource_key"] not in used_keys]
-    return allocation, remaining_nodes
-
-
 def choose_layout(
     nodes: list[dict[str, Any]]
 ) -> tuple[list[tuple[dict[str, Any], int]], list[tuple[dict[str, Any], int]]]:
     """
+    Simple full-node layout (8 GPUs per node).
+    Train and rollout are allocated on disjoint whole nodes.
+
     Input:
-      - nodes: list[dict], usually the output of `discover_gpu_nodes()`
+      nodes = [
+        {"ip": "10.0.0.1", "gpus": 8, "resource_key": "node:10.0.0.1"},
+        {"ip": "10.0.0.2", "gpus": 8, "resource_key": "node:10.0.0.2"},
+        {"ip": "10.0.0.3", "gpus": 8, "resource_key": "node:10.0.0.3"},
+      ]
 
     Output:
-      - (train_alloc, rollout_alloc)
-      - each is list[(node_dict, gpu_count_to_take)]
-
-    Example output shape:
       train_alloc = [
         ({"ip": "10.0.0.1", "gpus": 8, "resource_key": "node:10.0.0.1"}, 8),
         ({"ip": "10.0.0.2", "gpus": 8, "resource_key": "node:10.0.0.2"}, 8),
       ]
       rollout_alloc = [
-        ({"ip": "10.0.0.3", "gpus": 8, "resource_key": "node:10.0.0.3"}, 4),
+        ({"ip": "10.0.0.3", "gpus": 8, "resource_key": "node:10.0.0.3"}, 8),
       ]
-
-    Generic disjoint layout:
-      - train gets TRAIN_GPU_COUNT GPUs first
-      - rollout gets VLLM_GPU_COUNT GPUs from remaining nodes
     """
-    train_alloc, remaining_nodes = _allocate_gpus_on_disjoint_nodes(
-        nodes, TRAIN_GPU_COUNT
-    )
-    rollout_alloc, _ = _allocate_gpus_on_disjoint_nodes(
-        remaining_nodes, VLLM_GPU_COUNT
-    )
+    eligible_nodes = [n for n in nodes if n["gpus"] >= GPUS_PER_NODE]
+    train_node_count = TRAIN_GPU_COUNT // GPUS_PER_NODE
+    rollout_node_count = VLLM_GPU_COUNT // GPUS_PER_NODE
+    required_nodes = train_node_count + rollout_node_count
+
+    train_nodes = eligible_nodes[:train_node_count]
+    rollout_nodes = eligible_nodes[train_node_count:required_nodes]
+    train_alloc = [(n, GPUS_PER_NODE) for n in train_nodes]
+    rollout_alloc = [(n, GPUS_PER_NODE) for n in rollout_nodes]
     return train_alloc, rollout_alloc
 
 
@@ -175,14 +146,15 @@ def build_node_pinned_bundles(node_alloc: list[tuple[dict[str, Any], int]]) -> l
 
     Example input:
       node_alloc = [
-        ({"ip": "10.0.0.1", "resource_key": "node:10.0.0.1", "gpus": 8}, 2),
-        ({"ip": "10.0.0.2", "resource_key": "node:10.0.0.2", "gpus": 4}, 1),
+        ({"ip": "10.0.0.1", "resource_key": "node:10.0.0.1", "gpus": 8}, 8),
+        ({"ip": "10.0.0.2", "resource_key": "node:10.0.0.2", "gpus": 8}, 8),
       ]
 
     Example output:
       [
         {"GPU": 1.0, "CPU": 0.0, "node:10.0.0.1": 0.001},
         {"GPU": 1.0, "CPU": 0.0, "node:10.0.0.1": 0.001},
+        ...
         {"GPU": 1.0, "CPU": 0.0, "node:10.0.0.2": 0.001},
       ]
 
@@ -281,6 +253,12 @@ class TrainWorker:
         names: list[str] = []
         dtype_names: list[str] = []
         shapes: list[list[int]] = []
+        # _cached_weight_meta example (for rank0):
+        # names = ["model.embed_tokens.weight", "model.layers.0.self_attn.q_proj.weight", ...]
+        # dtype_names = ["bfloat16", "bfloat16", ...]
+        # shapes = [[151936, 1536], [1536, 1536], ...]
+        # return value is a tuple:
+        # (names, dtype_names, shapes)
         for name, tensor in full_state.items():
             if not torch.is_tensor(tensor):
                 continue
@@ -314,16 +292,26 @@ class TrainWorker:
         cfg = FullStateDictConfig(offload_to_cpu=False, rank0_only=True)
         with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, cfg):
             full_state = self.model.state_dict()
+        # full_state example (rank0-only full model state_dict):
+        # {
+        #   "model.embed_tokens.weight": tensor(shape=[151936, 1536], dtype=torch.bfloat16, ...),
+        #   "model.layers.0.self_attn.q_proj.weight": tensor(shape=[1536, 1536], dtype=torch.bfloat16, ...),
+        #   ...
+        # }
 
         if self.rank == 0:
-            if self.model_update_group is None:
-                raise RuntimeError("Rank0 transfer group is not initialized")
             names, _, _ = self._cached_weight_meta
             iterator = (
                 (name, full_state[name])
                 for name in names
                 if name in full_state and torch.is_tensor(full_state[name])
             )
+            # iterator example (lazy stream of (name, tensor) pairs):
+            # [
+            #   ("model.embed_tokens.weight", <tensor [151936, 1536] bfloat16>),
+            #   ("model.layers.0.self_attn.q_proj.weight", <tensor [1536, 1536] bfloat16>),
+            #   ...
+            # ]
             NCCLWeightTransferEngine.trainer_send_weights(
                 iterator=iterator,
                 group=self.model_update_group,
@@ -418,20 +406,21 @@ class TrainWorker:
                 False,
             )["log_probs"]
 
-            run_grpo_microbatch_train_step(
-                log_probs,
-                response_mask,
-                local_grad_accum,
-                LOSS_TYPE,
-                micro_rew,
-                micro_adv,
-                micro_old_lp,
-                1,
-            )
+            sync_ctx = nullcontext() if grad_step == (local_grad_accum - 1) else self.model.no_sync()
+            with sync_ctx:
+                run_grpo_microbatch_train_step(
+                    log_probs,
+                    response_mask,
+                    local_grad_accum,
+                    LOSS_TYPE,
+                    micro_rew,
+                    micro_adv,
+                    micro_old_lp,
+                    1,
+                )
 
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
-        dist.barrier()
 
         train_time = time.time() - train_start
         reward_mean = raw_rewards.float().mean().item()
@@ -465,7 +454,7 @@ def prepare_rollout_data():
 def extract_texts(rollout_results):
     return [r.outputs[0].text for r in rollout_results]
 
-
+# 喔！我知道了 接收方说我要收到第一个weight信息是 weight name叫"model.embed_tokens.weight"，dtype是bfloat16，然后shapes是[151936, 1536]，然后它收到的是一个key 是这名字"model.embed_tokens.weight"，value是一个tensor矩阵本身，这个矩阵的特征是dtype事blfloat16，行数151936，列数1536
 def transfer_weights(train_workers, llm):
     names, dtype_names, shapes = ray.get(train_workers[0].get_weight_metadata.remote())
     inference_handle = llm.update_weights.remote(
@@ -493,6 +482,11 @@ def main():
     connect_ray()
 
     gpu_nodes = discover_gpu_nodes()
+    # Example:
+    #   gpu_nodes -> [{"ip":"10.0.0.1","gpus":8,"resource_key":"node:10.0.0.1"}, ...]
+    #   choose_layout(gpu_nodes) ->
+    #     train_alloc=[({"ip":"10.0.0.1","gpus":8,"resource_key":"node:10.0.0.1"}, 8), ...]
+    #     rollout_alloc=[({"ip":"10.0.0.3","gpus":8,"resource_key":"node:10.0.0.3"}, 8)]
     train_alloc, rollout_alloc = choose_layout(gpu_nodes)
     print(f"[nodes] discovered={gpu_nodes}")
     print(f"[nodes] train_alloc={[(n['ip'], c) for n, c in train_alloc]}")
@@ -519,7 +513,7 @@ def main():
             train_master_port,
         )
         train_workers.append(worker)
-    print(f"[resource layout] train={TRAIN_GPU_COUNT} GPUs (fsdp world_size=32)")
+    print(f"[resource layout] train={TRAIN_GPU_COUNT} GPUs (fsdp world_size={TRAIN_GPU_COUNT})")
 
     rollout_bundles = build_node_pinned_bundles(rollout_alloc)
     pg_inference = placement_group(rollout_bundles)
